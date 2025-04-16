@@ -42,28 +42,30 @@
         .hidden {
             display: none;
         }
+        /* Center the single date input */
+        .date-input-container {
+            display: flex;
+            justify-content: center;
+        }
     </style>
 </head>
 <body class="bg-gray-100 p-8">
     <div class="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md">
 
         <h1 class="text-2xl font-bold mb-4 text-center text-blue-700">Riverside Ground Thaw Calculator</h1>
-        <p class="text-sm text-gray-600 mb-4 text-center">Estimate ground thaw potential for Newcastle, Maine using Open-Meteo historical data.</p>
+        <p class="text-sm text-gray-600 mb-4 text-center">Estimate soil temperature for Newcastle, Maine using Open-Meteo historical data.</p>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-            <div>
-                <label for="startDate" class="block text-sm font-medium text-gray-700 mb-1">Start Date:</label>
-                <input type="date" id="startDate" name="startDate" class="w-full p-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
-            </div>
-            <div>
-                <label for="endDate" class="block text-sm font-medium text-gray-700 mb-1">End Date:</label>
+        <div class="date-input-container mb-4">
+            <div class="w-full md:w-1/2 px-2">
+                <label for="endDate" class="block text-sm font-medium text-gray-700 mb-1">Select End Date:</label>
                 <input type="date" id="endDate" name="endDate" class="w-full p-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                <p class="text-xs text-gray-500 mt-1">Start date is automatically set to Jan 1st of the selected year.</p>
             </div>
         </div>
 
         <div class="text-center mb-6">
             <button id="calculateBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-md transition duration-150 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed">
-                Calculate TDD & Show Graph
+                Calculate Soil Temperature and Show Graph
                 <span id="loadingSpinner" class="loader hidden"></span>
             </button>
         </div>
@@ -71,9 +73,9 @@
         <div id="results" class="bg-gray-50 p-4 rounded-md border border-gray-200">
             <h2 class="text-lg font-semibold mb-2 text-gray-800">Results:</h2>
             <div id="output" class="text-gray-700">
-                <p>Enter a date range and click the button.</p>
+                <p>Select an end date and click the button.</p>
                 <p class="text-xs text-gray-500 mt-4">
-                    Weather data provided by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">Open-Meteo</a>. This tool provides an estimate; actual ground thaw varies.
+                    Weather data provided by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">Open-Meteo</a>. Soil temperature is an estimate. Data may lag by 1-3 days.
                 </p>
             </div>
              <div id="error" class="text-red-600 font-medium mt-2"></div>
@@ -87,14 +89,21 @@
 
     <script>
         // --- Configuration ---
-        const FREEZING_POINT_F = 32;
-        const WATER_ON_THRESHOLD_F_DAYS = 242;
+        const FREEZING_POINT_F = 32; // Still used for reference, but not directly in soil calc
+        // Soil Temperature Model Parameters
+        const STARTING_SOIL_TEMP_F = 20;   // Starting soil temp on Jan 1st
+        const TARGET_SOIL_TEMP_F = 42;   // Target soil temp for interpretation/graph line
+        const MAX_SOIL_TEMP_F = 65;      // Maximum estimated soil temp
+        const SOIL_SMOOTHING_FACTOR = 1 / 15; // Daily adjustment factor *** NEW ***
+        // Removed TDD calibration constants
+
+        // Location and Timezone
         const NEWCASTLE_LAT = 44.05;
         const NEWCASTLE_LON = -69.57;
         const TIMEZONE = "America/New_York";
+        const AXIS_PADDING = 5; // Degrees F padding for top/bottom of synced axes
 
         // --- DOM Elements ---
-        const startDateInput = document.getElementById('startDate');
         const endDateInput = document.getElementById('endDate');
         const calculateBtn = document.getElementById('calculateBtn');
         const outputDiv = document.getElementById('output');
@@ -104,20 +113,15 @@
         const chartCanvas = document.getElementById('tddChartCanvas');
 
         // --- Chart Instance Variable ---
-        let tddChart = null;
+        let soilTempChart = null;
 
         // --- Register Chart.js Plugins ---
-        // IMPORTANT: Register the annotation plugin after it's loaded
-        // The global variable exposed by the plugin script is ChartjsPluginAnnotation
         if (window.ChartjsPluginAnnotation) {
             Chart.register(ChartjsPluginAnnotation);
             console.log("Annotation plugin registered successfully.");
         } else {
             console.error("Chart.js Annotation Plugin not found. Annotations will not work.");
-            // Optionally display an error to the user if annotations are critical
-            // errorDiv.textContent = "Error: Chart annotation plugin failed to load.";
         }
-
 
         // --- Event Listener ---
         calculateBtn.addEventListener('click', handleCalculation);
@@ -125,44 +129,38 @@
         // --- Functions ---
 
         /**
-         * Handles the button click, shows loading state, fetches data, calculates, and displays results/graph.
+         * Handles the button click, determines date range, fetches data, calculates, and displays results/graph.
          */
         async function handleCalculation() {
             errorDiv.textContent = '';
-            outputDiv.innerHTML = '<p>Enter a date range and click the button.</p>';
+            outputDiv.innerHTML = '<p>Select an end date and click the button to calculate.</p>';
             chartContainer.classList.add('hidden');
-            if (tddChart) {
-                tddChart.destroy();
-                tddChart = null;
+            if (soilTempChart) {
+                soilTempChart.destroy();
+                soilTempChart = null;
             }
 
-            const startDateStr = startDateInput.value;
             const endDateStr = endDateInput.value;
-            if (!startDateStr || !endDateStr) {
-                errorDiv.textContent = 'Please select both a start and end date.';
-                return;
-            }
-            const startDate = new Date(startDateStr + 'T00:00:00');
+            if (!endDateStr) { errorDiv.textContent = 'Please select an end date.'; return; }
             const endDate = new Date(endDateStr + 'T00:00:00');
-            if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-                 errorDiv.textContent = 'Invalid date format selected.';
-                 return;
-            }
-            if (endDate < startDate) {
-                errorDiv.textContent = 'End date cannot be before the start date.';
-                return;
-            }
+            if (isNaN(endDate.getTime())) { errorDiv.textContent = 'Invalid end date format selected.'; return; }
+            const year = endDate.getFullYear();
+            const startDate = new Date(year, 0, 1);
+            const startDateStr = formatDateKey(startDate);
+            if (endDate < startDate) { errorDiv.textContent = 'End date cannot be before January 1st of the same year.'; return; }
 
             calculateBtn.disabled = true;
             loadingSpinner.classList.remove('hidden');
-            outputDiv.innerHTML = `<p>Fetching historical weather data from Open-Meteo...</p>`;
+            outputDiv.innerHTML = `<p>Fetching historical weather data from Open-Meteo (Jan 1, ${year} to ${endDateStr})...</p>`;
 
             try {
                 const dailyAverages = await fetchOpenMeteoData(startDateStr, endDateStr);
                 if (dailyAverages) {
-                    calculateAndDisplayTDDAndGraph(dailyAverages, startDate, endDate);
+                    calculateAndDisplaySoilTempAndGraph(dailyAverages, startDate, endDate);
                 } else {
                      chartContainer.classList.add('hidden');
+                     if (!errorDiv.textContent) errorDiv.textContent = "Failed to retrieve weather data.";
+                     outputDiv.innerHTML = '<p>Could not retrieve weather data for the selected range.</p>';
                 }
             } catch (error) {
                 console.error("Calculation error:", error);
@@ -183,101 +181,123 @@
          */
         async function fetchOpenMeteoData(startDateStr, endDateStr) {
             const apiUrl = `https://archive-api.open-meteo.com/v1/archive?latitude=${NEWCASTLE_LAT}&longitude=${NEWCASTLE_LON}&start_date=${startDateStr}&end_date=${endDateStr}&daily=temperature_2m_mean&temperature_unit=fahrenheit&timezone=${encodeURIComponent(TIMEZONE)}`;
-            outputDiv.innerHTML += `<p>Requesting data...</p>`;
             errorDiv.textContent = '';
-
             try {
                 const response = await fetch(apiUrl);
                 if (!response.ok) {
                     let errorMsg = `Open-Meteo API request failed: ${response.status} ${response.statusText}`;
-                     try {
-                        const errorData = await response.json();
-                        if (errorData && errorData.reason) errorMsg += ` - ${errorData.reason}`;
-                     } catch (e) { /* Ignore */ }
-                    console.error("Open-Meteo API Error:", errorMsg);
-                    errorDiv.textContent = errorMsg;
-                    outputDiv.innerHTML += `<p class="text-red-600">Failed to fetch data. Status: ${response.status}.</p>`;
-                    return null;
+                     try { const errorData = await response.json(); if (errorData && errorData.reason) errorMsg += ` - ${errorData.reason}`; } catch (e) { /* Ignore */ }
+                    console.error("Open-Meteo API Error:", errorMsg); errorDiv.textContent = errorMsg; return null;
                 }
-                const data = await response.json();
-                console.log("Open-Meteo API Response:", data);
-                if (!data.daily || !data.daily.time || !data.daily.temperature_2m_mean) {
-                    console.error("Open-Meteo response missing expected daily data.");
-                    errorDiv.textContent = "Received incomplete data from Open-Meteo.";
-                    outputDiv.innerHTML += `<p class="text-red-600">API response format was unexpected.</p>`;
-                    return null;
+                const data = await response.json(); console.log("Open-Meteo API Response:", data);
+                if (!data.daily || !data.daily.time || !data.daily.temperature_2m_mean || data.daily.time.length === 0) {
+                    console.error("Open-Meteo response missing expected daily data or returned empty dataset."); errorDiv.textContent = "Received no data or incomplete data from Open-Meteo for this range."; return null;
                 }
-                outputDiv.innerHTML += `<p>Received data for ${data.daily.time.length} days. Processing...</p>`;
                 const dailyAverages = {};
                 for (let i = 0; i < data.daily.time.length; i++) {
-                    const dateKey = data.daily.time[i];
-                    const avgTemp = data.daily.temperature_2m_mean[i];
+                    const dateKey = data.daily.time[i]; const avgTemp = data.daily.temperature_2m_mean[i];
                     dailyAverages[dateKey] = (avgTemp !== null && typeof avgTemp !== 'undefined') ? avgTemp : null;
-                    if (dailyAverages[dateKey] === null) {
-                         console.warn(`Missing temperature data for ${dateKey}`);
-                    }
+                    if (dailyAverages[dateKey] === null) console.warn(`Missing temperature data for ${dateKey}`);
                 }
-                console.log("Processed Daily Averages:", dailyAverages);
-                return dailyAverages;
+                console.log("Processed Daily Averages:", dailyAverages); return dailyAverages;
             } catch (error) {
-                console.error("Error fetching or processing Open-Meteo data:", error);
-                 errorDiv.textContent = `Error fetching weather data: ${error.message}. Check network connection and console.`;
-                 outputDiv.innerHTML += `<p class="text-red-600">An error occurred fetching data.</p>`;
-                return null;
+                console.error("Error fetching or processing Open-Meteo data:", error); errorDiv.textContent = `Error fetching weather data: ${error.message}. Check network connection and console.`; return null;
             }
         }
 
         /**
-         * Calculates TDD, prepares data for the graph, displays text results, and renders the graph.
+         * Estimates soil temperature using the exponential smoothing model, prepares graph data,
+         * displays text results, and renders the graph.
          * @param {object} dailyAverages - Object mapping "YYYY-MM-DD" to average temp (°F) or null.
-         * @param {Date} startDate - The start date of the calculation period.
+         * @param {Date} startDate - The start date of the calculation period (Jan 1st).
          * @param {Date} endDate - The end date of the calculation period.
          */
-        function calculateAndDisplayTDDAndGraph(dailyAverages, startDate, endDate) {
-            let cumulativeTDD = 0;
+        function calculateAndDisplaySoilTempAndGraph(dailyAverages, startDate, endDate) {
+            outputDiv.innerHTML = '<p>Processing data...</p>';
+            // Removed TDD variables
             let daysProcessed = 0;
             let daysMissingData = 0;
             let totalDaysInRange = 0;
+            let finalEstSoilTemp = STARTING_SOIL_TEMP_F; // Initialize final value
+
             const chartLabels = [];
-            const chartTemperatures = [];
-            const chartCumulativeTDD = [];
+            const chartAirTemperatures = [];
+            const chartSoilTemperatures = [];
 
             if (!dailyAverages || Object.keys(dailyAverages).length === 0) {
-                 outputDiv.innerHTML = `<p>No valid daily average temperature data could be processed from Open-Meteo for the selected range.</p>`;
+                 outputDiv.innerHTML = `<p>No valid daily average temperature data could be processed.</p>`;
                  if (!errorDiv.textContent) errorDiv.textContent = 'Processing resulted in no usable data.';
                  chartContainer.classList.add('hidden');
                  return;
             }
 
+            // Removed slope calculation
+
             let iterDate = new Date(startDate);
             const finalDate = new Date(endDate);
+            let previousSoilTemp = STARTING_SOIL_TEMP_F; // Initialize for the loop
+
             while (iterDate <= finalDate) {
                 totalDaysInRange++;
                 const dateKey = formatDateKey(iterDate);
-                const avgTemp = dailyAverages.hasOwnProperty(dateKey) ? dailyAverages[dateKey] : null;
+                const avgAirTemp = dailyAverages.hasOwnProperty(dateKey) ? dailyAverages[dateKey] : null;
+
                 const label = iterDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 chartLabels.push(label);
-                chartTemperatures.push(avgTemp);
+                chartAirTemperatures.push(avgAirTemp);
 
-                if (avgTemp !== null) {
+                let currentSoilTemp; // Use a temporary variable for the current day's calculation
+
+                if (avgAirTemp !== null) {
                     daysProcessed++;
-                    if (avgTemp > FREEZING_POINT_F) {
-                        cumulativeTDD += (avgTemp - FREEZING_POINT_F);
-                    }
+                    // *** New Soil Temp Calculation Model ***
+                    const difference = avgAirTemp - previousSoilTemp;
+                    const change = SOIL_SMOOTHING_FACTOR * difference;
+                    const calculatedTemp = previousSoilTemp + change;
+
+                    // Apply min/max caps
+                    currentSoilTemp = Math.max(STARTING_SOIL_TEMP_F, Math.min(MAX_SOIL_TEMP_F, calculatedTemp));
+                    // *** Removed the Math.min(..., avgAirTemp) constraint ***
+
                 } else {
+                    // If air temp data is missing, assume soil temp doesn't change
                     daysMissingData++;
+                    currentSoilTemp = previousSoilTemp;
                 }
-                chartCumulativeTDD.push(cumulativeTDD);
+
+                chartSoilTemperatures.push(currentSoilTemp);
+                finalEstSoilTemp = currentSoilTemp; // Update final value for display
+                previousSoilTemp = currentSoilTemp; // Set up for the next day's calculation
+
                 iterDate.setDate(iterDate.getDate() + 1);
             }
 
-            displayFinalResultsText(cumulativeTDD, daysProcessed, daysMissingData, totalDaysInRange, startDate, endDate);
+            // --- Determine Common Axis Range ---
+            // This logic remains the same, finds min/max across the final calculated data
+            let commonMin = STARTING_SOIL_TEMP_F;
+            let commonMax = STARTING_SOIL_TEMP_F;
+            const validAirTemps = chartAirTemperatures.filter(t => t !== null);
+            if (validAirTemps.length > 0) {
+                commonMin = Math.min(commonMin, ...validAirTemps);
+                commonMax = Math.max(commonMax, ...validAirTemps);
+            }
+             if (chartSoilTemperatures.length > 0) {
+                 commonMax = Math.max(commonMax, ...chartSoilTemperatures);
+             }
+            commonMax = Math.max(commonMax, MAX_SOIL_TEMP_F); // Ensure max cap is considered
+            commonMin -= AXIS_PADDING;
+            commonMax += AXIS_PADDING;
+            // --- End Determine Common Axis Range ---
+
 
             if (daysProcessed > 0) {
-                 renderChart(chartLabels, chartTemperatures, chartCumulativeTDD);
+                 displayFinalSoilTempText(finalEstSoilTemp, daysProcessed, daysMissingData, totalDaysInRange, startDate, endDate);
+                 renderChart(chartLabels, chartAirTemperatures, chartSoilTemperatures, commonMin, commonMax);
                  chartContainer.classList.remove('hidden');
             } else {
-                chartContainer.classList.add('hidden');
+                 outputDiv.innerHTML = `<p>No valid temperature data points were found within the selected date range.</p>`;
+                 if (!errorDiv.textContent) errorDiv.textContent = 'No processable data available.';
+                 chartContainer.classList.add('hidden');
             }
         }
 
@@ -295,65 +315,63 @@
         }
 
          /**
-         * Displays only the final text-based TDD results and interpretation, focusing on the water threshold.
-         * @param {number} finalTDD - The final cumulative Thawing Degree Days.
+         * Displays the final text-based results, comparing estimated soil temp against the TARGET_SOIL_TEMP_F (42°F).
+         * @param {number} finalSoilTemp - The final estimated soil temperature (°F).
          * @param {number} daysProcessed - Number of days with processed data.
          * @param {number} daysMissingData - Number of days missing data.
          * @param {number} totalDaysInRange - Total number of days selected.
-         * @param {Date} startDate - Start date for display.
+         * @param {Date} startDate - Start date for display (Jan 1st).
          * @param {Date} endDate - End date for display.
          */
-        function displayFinalResultsText(finalTDD, daysProcessed, daysMissingData, totalDaysInRange, startDate, endDate) {
+        function displayFinalSoilTempText(finalSoilTemp, daysProcessed, daysMissingData, totalDaysInRange, startDate, endDate) {
              const formattedStartDate = startDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
              const formattedEndDate = endDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
              let html = `<p><strong>Date Range:</strong> ${formattedStartDate} to ${formattedEndDate} (${totalDaysInRange} days)</p>`;
-
-             if (daysProcessed === 0) {
-                 html += `<p class="text-orange-600">No temperature data was available from Open-Meteo for any day in the selected range.</p>`;
+             html += `<p><strong>Final Estimated Soil Temp:</strong> ${finalSoilTemp.toFixed(1)} °F (calculated from ${daysProcessed} days)</p>`;
+             let interpretation = "";
+             if (finalSoilTemp >= TARGET_SOIL_TEMP_F) {
+                 interpretation = `The estimated soil temperature <strong class="text-green-600">has reached the target of ${TARGET_SOIL_TEMP_F}°F</strong>. It may be suitable to turn on outdoor water.`;
              } else {
-                 html += `<p><strong>Final Cumulative TDD:</strong> ${finalTDD.toFixed(1)} °F-days (calculated from ${daysProcessed} days)</p>`;
-                 let interpretation = "";
-                 if (finalTDD >= WATER_ON_THRESHOLD_F_DAYS) {
-                     interpretation = `The threshold for turning on outdoor water (${WATER_ON_THRESHOLD_F_DAYS} °F-days) <strong class="text-green-600">has been reached</strong>. The ground is likely sufficiently thawed.`;
-                 } else {
-                     interpretation = `The threshold for turning on outdoor water (${WATER_ON_THRESHOLD_F_DAYS} °F-days) <strong class="text-orange-600">has not yet been reached</strong>. (${(WATER_ON_THRESHOLD_F_DAYS - finalTDD).toFixed(1)} °F-days remaining).`;
-                 }
-                 html += `<p><strong>Interpretation:</strong> ${interpretation}</p>`;
+                 interpretation = `The estimated soil temperature <strong class="text-orange-600">has not yet reached the target of ${TARGET_SOIL_TEMP_F}°F</strong>. (${(TARGET_SOIL_TEMP_F - finalSoilTemp).toFixed(1)}°F remaining).`;
              }
+             html += `<p><strong>Interpretation:</strong> ${interpretation}</p>`;
+
              if (daysMissingData > 0) {
-                html += `<p class="text-sm text-yellow-700 mt-2">Note: Open-Meteo data was unavailable or missing for ${daysMissingData} day(s) within the requested range.</p>`;
+                html += `<p class="text-sm text-yellow-700 mt-2">Note: Air temperature data was unavailable or missing for ${daysMissingData} day(s) within the requested range.</p>`;
              }
+             // Updated disclaimer for the new model
              html += `<p class="text-xs text-gray-500 mt-4">
-                        <strong>Disclaimer:</strong> Estimation based on historical air temperature data. Actual ground thaw depends on many factors (snow cover, soil type, moisture, sun exposure, etc.) and can vary significantly. The water turn-on threshold (${WATER_ON_THRESHOLD_F_DAYS} °F-days) is a guideline. Data by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">Open-Meteo</a>.
+                        <strong>Disclaimer:</strong> Soil temperature is estimated using a daily adjustment model: SoilTemp_Today = SoilTemp_Yesterday + (${SOIL_SMOOTHING_FACTOR.toFixed(3)}) * (AirTemp_Today - SoilTemp_Yesterday). It assumes a start temp of ${STARTING_SOIL_TEMP_F}°F on Jan 1st and is capped at a maximum of ${MAX_SOIL_TEMP_F}°F. The target for interpretation is ${TARGET_SOIL_TEMP_F}°F. Actual ground temperature depends on many factors (snow cover, soil type, moisture, sun exposure, etc.) and can vary significantly. This is a guideline only. Air temp data by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">Open-Meteo</a>. Data may lag by 1-3 days.
                     </p>`;
              outputDiv.innerHTML = html;
         }
 
         /**
-         * Renders the chart using Chart.js, including the threshold annotation.
+         * Renders the chart using Chart.js, applying a common scale to both Y-axes.
          * @param {string[]} labels - Array of date labels for the X-axis.
-         * @param {(number|null)[]} tempData - Array of daily average temperatures (°F), null for missing.
-         * @param {number[]} tddData - Array of cumulative TDD values (°F-days).
+         * @param {(number|null)[]} airTempData - Array of daily average air temperatures (°F), null for missing.
+         * @param {number[]} soilTempData - Array of estimated soil temperatures (°F).
+         * @param {number} commonMin - The calculated minimum value for both Y-axes (including padding).
+         * @param {number} commonMax - The calculated maximum value for both Y-axes (including padding).
          */
-        function renderChart(labels, tempData, tddData) {
-             if (tddChart) {
-                tddChart.destroy();
+        function renderChart(labels, airTempData, soilTempData, commonMin, commonMax) {
+             if (soilTempChart) {
+                soilTempChart.destroy();
             }
             const ctx = chartCanvas.getContext('2d');
-            // Ensure the plugin is registered before creating the chart
-             if (!window.ChartjsPluginAnnotation) {
-                 console.error("Annotation plugin not registered or loaded!");
-                 // Potentially skip annotation config if plugin missing
-             }
+             if (!window.ChartjsPluginAnnotation) console.error("Annotation plugin not registered or loaded!");
 
-            tddChart = new Chart(ctx, {
+            const annotationValue = TARGET_SOIL_TEMP_F;
+            commonMax = Math.max(commonMax, MAX_SOIL_TEMP_F + AXIS_PADDING); // Ensure max cap is visible
+
+            soilTempChart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: labels,
                     datasets: [
                         {
-                            label: 'Avg Daily Temp (°F)',
-                            data: tempData,
+                            label: 'Avg Daily Air Temp (°F)',
+                            data: airTempData,
                             borderColor: 'rgb(59, 130, 246)',
                             backgroundColor: 'rgba(59, 130, 246, 0.1)',
                             yAxisID: 'y',
@@ -363,8 +381,8 @@
                             spanGaps: true
                         },
                         {
-                            label: 'Cumulative TDD (°F-days)',
-                            data: tddData,
+                            label: 'Estimated Soil Temp (°F)',
+                            data: soilTempData,
                             borderColor: 'rgb(234, 88, 12)',
                             backgroundColor: 'rgba(234, 88, 12, 0.1)',
                             yAxisID: 'y1',
@@ -380,34 +398,30 @@
                     interaction: { mode: 'index', intersect: false },
                     stacked: false,
                     plugins: {
-                        title: { display: true, text: 'Temperature and Cumulative TDD Trend' },
+                        title: { display: true, text: 'Air Temperature and Estimated Soil Temperature Trend' },
                         tooltip: {
                             callbacks: {
                                 label: function(context) {
                                     let label = context.dataset.label || '';
                                     if (label) label += ': ';
                                     if (context.parsed.y !== null) {
-                                        const units = context.dataset.yAxisID === 'y1' ? ' °F-days' : ' °F';
-                                        label += context.parsed.y.toFixed(1) + units;
-                                    } else {
-                                        label += 'No data';
-                                    }
+                                        label += context.parsed.y.toFixed(1) + ' °F';
+                                    } else { label += 'No data'; }
                                     return label;
                                 }
                             }
                         },
-                        // Annotation Plugin Configuration (ensure plugin is registered)
                         annotation: {
                             annotations: {
                                 thresholdLine: {
                                     type: 'line',
                                     yScaleID: 'y1',
-                                    value: WATER_ON_THRESHOLD_F_DAYS,
+                                    value: annotationValue,
                                     borderColor: 'rgb(34, 197, 94)',
                                     borderWidth: 2,
                                     borderDash: [6, 6],
                                     label: {
-                                        content: `Water On Threshold (${WATER_ON_THRESHOLD_F_DAYS} F-days)`,
+                                        content: `Target Soil Temp (${TARGET_SOIL_TEMP_F}°F)`,
                                         display: true,
                                         position: 'end',
                                         backgroundColor: 'rgba(34, 197, 94, 0.7)',
@@ -423,21 +437,29 @@
                     },
                     scales: {
                         x: { display: true, title: { display: true, text: 'Date' } },
-                        y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Avg Temp (°F)', color: 'rgb(59, 130, 246)' }, grid: { drawOnChartArea: true } },
-                        y1: { type: 'linear', display: true, position: 'right', title: { display: true, text: 'Cumulative TDD (°F-days)', color: 'rgb(234, 88, 12)' }, grid: { drawOnChartArea: false }, suggestedMin: 0 }
+                        y: { // Left Y-axis (Air Temperature) - Synced Scale
+                            type: 'linear', display: true, position: 'left',
+                            title: { display: true, text: 'Avg Air Temp (°F)', color: 'rgb(59, 130, 246)' },
+                            grid: { drawOnChartArea: true },
+                            min: commonMin,
+                            max: commonMax
+                        },
+                        y1: { // Right Y-axis (Soil Temperature) - Synced Scale
+                            type: 'linear', display: true, position: 'right',
+                            title: { display: true, text: 'Est. Soil Temp (°F)', color: 'rgb(234, 88, 12)' },
+                            grid: { drawOnChartArea: false },
+                            min: commonMin,
+                            max: commonMax
+                        }
                     }
                 }
             });
         }
 
-        // Set default dates: Jan 1st of current year to current date
+        // Set default end date: Current date
         window.onload = () => {
             const today = new Date();
-            const currentYear = today.getFullYear();
-            const startDateDefault = new Date(currentYear, 0, 1); // Jan 1st
-            const endDateDefault = today; // Current date
-            startDateInput.value = formatDateKey(startDateDefault);
-            endDateInput.value = formatDateKey(endDateDefault);
+            endDateInput.value = formatDateKey(today);
         };
 
     </script>
