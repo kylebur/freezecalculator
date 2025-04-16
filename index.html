@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Riverside Ground Thaw Calculator - Newcastle, ME (Open-Meteo)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-annotation/3.0.1/chartjs-plugin-annotation.min.js" integrity="sha512-Hn1w6YjiJ/TRaWJVbXKH8NyBiJuFlLBl3/cdT5/eTnrMS07hH0h85LhEV3NgUvecrIfL8UfsPAg9MA09YNOamg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        #results, #chartContainer {
+            min-height: 100px;
+        }
+        #chartContainer {
+             position: relative;
+             height: 400px;
+             margin-top: 1.5rem;
+             border: 1px solid #e5e7eb;
+             padding: 1rem;
+             border-radius: 0.375rem;
+             background-color: #f9fafb;
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 p-8">
+    <div class="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md">
+
+        <h1 class="text-2xl font-bold mb-4 text-center text-blue-700">Riverside Ground Thaw Calculator</h1>
+        <p class="text-sm text-gray-600 mb-4 text-center">Estimate ground thaw potential for Newcastle, Maine using Open-Meteo historical data.</p>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            <div>
+                <label for="startDate" class="block text-sm font-medium text-gray-700 mb-1">Start Date:</label>
+                <input type="date" id="startDate" name="startDate" class="w-full p-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+            </div>
+            <div>
+                <label for="endDate" class="block text-sm font-medium text-gray-700 mb-1">End Date:</label>
+                <input type="date" id="endDate" name="endDate" class="w-full p-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+            </div>
+        </div>
+
+        <div class="text-center mb-6">
+            <button id="calculateBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-md transition duration-150 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed">
+                Calculate TDD & Show Graph
+                <span id="loadingSpinner" class="loader hidden"></span>
+            </button>
+        </div>
+
+        <div id="results" class="bg-gray-50 p-4 rounded-md border border-gray-200">
+            <h2 class="text-lg font-semibold mb-2 text-gray-800">Results:</h2>
+            <div id="output" class="text-gray-700">
+                <p>Enter a date range and click the button.</p>
+                <p class="text-xs text-gray-500 mt-4">
+                    Weather data provided by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">Open-Meteo</a>. This tool provides an estimate; actual ground thaw varies.
+                </p>
+            </div>
+             <div id="error" class="text-red-600 font-medium mt-2"></div>
+        </div>
+
+        <div id="chartContainer" class="hidden">
+             <canvas id="tddChartCanvas"></canvas>
+        </div>
+
+    </div>
+
+    <script>
+        // --- Configuration ---
+        const FREEZING_POINT_F = 32;
+        const WATER_ON_THRESHOLD_F_DAYS = 242;
+        const NEWCASTLE_LAT = 44.05;
+        const NEWCASTLE_LON = -69.57;
+        const TIMEZONE = "America/New_York";
+
+        // --- DOM Elements ---
+        const startDateInput = document.getElementById('startDate');
+        const endDateInput = document.getElementById('endDate');
+        const calculateBtn = document.getElementById('calculateBtn');
+        const outputDiv = document.getElementById('output');
+        const errorDiv = document.getElementById('error');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const chartContainer = document.getElementById('chartContainer');
+        const chartCanvas = document.getElementById('tddChartCanvas');
+
+        // --- Chart Instance Variable ---
+        let tddChart = null;
+
+        // --- Register Chart.js Plugins ---
+        // IMPORTANT: Register the annotation plugin after it's loaded
+        // The global variable exposed by the plugin script is ChartjsPluginAnnotation
+        if (window.ChartjsPluginAnnotation) {
+            Chart.register(ChartjsPluginAnnotation);
+            console.log("Annotation plugin registered successfully.");
+        } else {
+            console.error("Chart.js Annotation Plugin not found. Annotations will not work.");
+            // Optionally display an error to the user if annotations are critical
+            // errorDiv.textContent = "Error: Chart annotation plugin failed to load.";
+        }
+
+
+        // --- Event Listener ---
+        calculateBtn.addEventListener('click', handleCalculation);
+
+        // --- Functions ---
+
+        /**
+         * Handles the button click, shows loading state, fetches data, calculates, and displays results/graph.
+         */
+        async function handleCalculation() {
+            errorDiv.textContent = '';
+            outputDiv.innerHTML = '<p>Enter a date range and click the button.</p>';
+            chartContainer.classList.add('hidden');
+            if (tddChart) {
+                tddChart.destroy();
+                tddChart = null;
+            }
+
+            const startDateStr = startDateInput.value;
+            const endDateStr = endDateInput.value;
+            if (!startDateStr || !endDateStr) {
+                errorDiv.textContent = 'Please select both a start and end date.';
+                return;
+            }
+            const startDate = new Date(startDateStr + 'T00:00:00');
+            const endDate = new Date(endDateStr + 'T00:00:00');
+            if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+                 errorDiv.textContent = 'Invalid date format selected.';
+                 return;
+            }
+            if (endDate < startDate) {
+                errorDiv.textContent = 'End date cannot be before the start date.';
+                return;
+            }
+
+            calculateBtn.disabled = true;
+            loadingSpinner.classList.remove('hidden');
+            outputDiv.innerHTML = `<p>Fetching historical weather data from Open-Meteo...</p>`;
+
+            try {
+                const dailyAverages = await fetchOpenMeteoData(startDateStr, endDateStr);
+                if (dailyAverages) {
+                    calculateAndDisplayTDDAndGraph(dailyAverages, startDate, endDate);
+                } else {
+                     chartContainer.classList.add('hidden');
+                }
+            } catch (error) {
+                console.error("Calculation error:", error);
+                errorDiv.textContent = `An unexpected error occurred: ${error.message}`;
+                outputDiv.innerHTML = '<p>Could not complete calculation.</p>';
+                chartContainer.classList.add('hidden');
+            } finally {
+                calculateBtn.disabled = false;
+                loadingSpinner.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Fetches historical daily average temperature data from Open-Meteo.
+         * @param {string} startDateStr - Start date in "YYYY-MM-DD" format.
+         * @param {string} endDateStr - End date in "YYYY-MM-DD" format.
+         * @returns {Promise<object|null>} A promise resolving to an object mapping "YYYY-MM-DD" to average temp (°F), or null on failure.
+         */
+        async function fetchOpenMeteoData(startDateStr, endDateStr) {
+            const apiUrl = `https://archive-api.open-meteo.com/v1/archive?latitude=${NEWCASTLE_LAT}&longitude=${NEWCASTLE_LON}&start_date=${startDateStr}&end_date=${endDateStr}&daily=temperature_2m_mean&temperature_unit=fahrenheit&timezone=${encodeURIComponent(TIMEZONE)}`;
+            outputDiv.innerHTML += `<p>Requesting data...</p>`;
+            errorDiv.textContent = '';
+
+            try {
+                const response = await fetch(apiUrl);
+                if (!response.ok) {
+                    let errorMsg = `Open-Meteo API request failed: ${response.status} ${response.statusText}`;
+                     try {
+                        const errorData = await response.json();
+                        if (errorData && errorData.reason) errorMsg += ` - ${errorData.reason}`;
+                     } catch (e) { /* Ignore */ }
+                    console.error("Open-Meteo API Error:", errorMsg);
+                    errorDiv.textContent = errorMsg;
+                    outputDiv.innerHTML += `<p class="text-red-600">Failed to fetch data. Status: ${response.status}.</p>`;
+                    return null;
+                }
+                const data = await response.json();
+                console.log("Open-Meteo API Response:", data);
+                if (!data.daily || !data.daily.time || !data.daily.temperature_2m_mean) {
+                    console.error("Open-Meteo response missing expected daily data.");
+                    errorDiv.textContent = "Received incomplete data from Open-Meteo.";
+                    outputDiv.innerHTML += `<p class="text-red-600">API response format was unexpected.</p>`;
+                    return null;
+                }
+                outputDiv.innerHTML += `<p>Received data for ${data.daily.time.length} days. Processing...</p>`;
+                const dailyAverages = {};
+                for (let i = 0; i < data.daily.time.length; i++) {
+                    const dateKey = data.daily.time[i];
+                    const avgTemp = data.daily.temperature_2m_mean[i];
+                    dailyAverages[dateKey] = (avgTemp !== null && typeof avgTemp !== 'undefined') ? avgTemp : null;
+                    if (dailyAverages[dateKey] === null) {
+                         console.warn(`Missing temperature data for ${dateKey}`);
+                    }
+                }
+                console.log("Processed Daily Averages:", dailyAverages);
+                return dailyAverages;
+            } catch (error) {
+                console.error("Error fetching or processing Open-Meteo data:", error);
+                 errorDiv.textContent = `Error fetching weather data: ${error.message}. Check network connection and console.`;
+                 outputDiv.innerHTML += `<p class="text-red-600">An error occurred fetching data.</p>`;
+                return null;
+            }
+        }
+
+        /**
+         * Calculates TDD, prepares data for the graph, displays text results, and renders the graph.
+         * @param {object} dailyAverages - Object mapping "YYYY-MM-DD" to average temp (°F) or null.
+         * @param {Date} startDate - The start date of the calculation period.
+         * @param {Date} endDate - The end date of the calculation period.
+         */
+        function calculateAndDisplayTDDAndGraph(dailyAverages, startDate, endDate) {
+            let cumulativeTDD = 0;
+            let daysProcessed = 0;
+            let daysMissingData = 0;
+            let totalDaysInRange = 0;
+            const chartLabels = [];
+            const chartTemperatures = [];
+            const chartCumulativeTDD = [];
+
+            if (!dailyAverages || Object.keys(dailyAverages).length === 0) {
+                 outputDiv.innerHTML = `<p>No valid daily average temperature data could be processed from Open-Meteo for the selected range.</p>`;
+                 if (!errorDiv.textContent) errorDiv.textContent = 'Processing resulted in no usable data.';
+                 chartContainer.classList.add('hidden');
+                 return;
+            }
+
+            let iterDate = new Date(startDate);
+            const finalDate = new Date(endDate);
+            while (iterDate <= finalDate) {
+                totalDaysInRange++;
+                const dateKey = formatDateKey(iterDate);
+                const avgTemp = dailyAverages.hasOwnProperty(dateKey) ? dailyAverages[dateKey] : null;
+                const label = iterDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                chartLabels.push(label);
+                chartTemperatures.push(avgTemp);
+
+                if (avgTemp !== null) {
+                    daysProcessed++;
+                    if (avgTemp > FREEZING_POINT_F) {
+                        cumulativeTDD += (avgTemp - FREEZING_POINT_F);
+                    }
+                } else {
+                    daysMissingData++;
+                }
+                chartCumulativeTDD.push(cumulativeTDD);
+                iterDate.setDate(iterDate.getDate() + 1);
+            }
+
+            displayFinalResultsText(cumulativeTDD, daysProcessed, daysMissingData, totalDaysInRange, startDate, endDate);
+
+            if (daysProcessed > 0) {
+                 renderChart(chartLabels, chartTemperatures, chartCumulativeTDD);
+                 chartContainer.classList.remove('hidden');
+            } else {
+                chartContainer.classList.add('hidden');
+            }
+        }
+
+
+        /**
+         * Formats a Date object into "YYYY-MM-DD" string format for lookup keys.
+         * @param {Date} date - The date object to format.
+         * @returns {string} The formatted date string.
+         */
+        function formatDateKey(date) {
+            const year = date.getUTCFullYear();
+            const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+            const day = String(date.getUTCDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+         /**
+         * Displays only the final text-based TDD results and interpretation, focusing on the water threshold.
+         * @param {number} finalTDD - The final cumulative Thawing Degree Days.
+         * @param {number} daysProcessed - Number of days with processed data.
+         * @param {number} daysMissingData - Number of days missing data.
+         * @param {number} totalDaysInRange - Total number of days selected.
+         * @param {Date} startDate - Start date for display.
+         * @param {Date} endDate - End date for display.
+         */
+        function displayFinalResultsText(finalTDD, daysProcessed, daysMissingData, totalDaysInRange, startDate, endDate) {
+             const formattedStartDate = startDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+             const formattedEndDate = endDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+             let html = `<p><strong>Date Range:</strong> ${formattedStartDate} to ${formattedEndDate} (${totalDaysInRange} days)</p>`;
+
+             if (daysProcessed === 0) {
+                 html += `<p class="text-orange-600">No temperature data was available from Open-Meteo for any day in the selected range.</p>`;
+             } else {
+                 html += `<p><strong>Final Cumulative TDD:</strong> ${finalTDD.toFixed(1)} °F-days (calculated from ${daysProcessed} days)</p>`;
+                 let interpretation = "";
+                 if (finalTDD >= WATER_ON_THRESHOLD_F_DAYS) {
+                     interpretation = `The threshold for turning on outdoor water (${WATER_ON_THRESHOLD_F_DAYS} °F-days) <strong class="text-green-600">has been reached</strong>. The ground is likely sufficiently thawed.`;
+                 } else {
+                     interpretation = `The threshold for turning on outdoor water (${WATER_ON_THRESHOLD_F_DAYS} °F-days) <strong class="text-orange-600">has not yet been reached</strong>. (${(WATER_ON_THRESHOLD_F_DAYS - finalTDD).toFixed(1)} °F-days remaining).`;
+                 }
+                 html += `<p><strong>Interpretation:</strong> ${interpretation}</p>`;
+             }
+             if (daysMissingData > 0) {
+                html += `<p class="text-sm text-yellow-700 mt-2">Note: Open-Meteo data was unavailable or missing for ${daysMissingData} day(s) within the requested range.</p>`;
+             }
+             html += `<p class="text-xs text-gray-500 mt-4">
+                        <strong>Disclaimer:</strong> Estimation based on historical air temperature data. Actual ground thaw depends on many factors (snow cover, soil type, moisture, sun exposure, etc.) and can vary significantly. The water turn-on threshold (${WATER_ON_THRESHOLD_F_DAYS} °F-days) is a guideline. Data by <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">Open-Meteo</a>.
+                    </p>`;
+             outputDiv.innerHTML = html;
+        }
+
+        /**
+         * Renders the chart using Chart.js, including the threshold annotation.
+         * @param {string[]} labels - Array of date labels for the X-axis.
+         * @param {(number|null)[]} tempData - Array of daily average temperatures (°F), null for missing.
+         * @param {number[]} tddData - Array of cumulative TDD values (°F-days).
+         */
+        function renderChart(labels, tempData, tddData) {
+             if (tddChart) {
+                tddChart.destroy();
+            }
+            const ctx = chartCanvas.getContext('2d');
+            // Ensure the plugin is registered before creating the chart
+             if (!window.ChartjsPluginAnnotation) {
+                 console.error("Annotation plugin not registered or loaded!");
+                 // Potentially skip annotation config if plugin missing
+             }
+
+            tddChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'Avg Daily Temp (°F)',
+                            data: tempData,
+                            borderColor: 'rgb(59, 130, 246)',
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            yAxisID: 'y',
+                            tension: 0.1,
+                            pointRadius: 2,
+                            pointHoverRadius: 4,
+                            spanGaps: true
+                        },
+                        {
+                            label: 'Cumulative TDD (°F-days)',
+                            data: tddData,
+                            borderColor: 'rgb(234, 88, 12)',
+                            backgroundColor: 'rgba(234, 88, 12, 0.1)',
+                            yAxisID: 'y1',
+                            tension: 0.1,
+                            pointRadius: 2,
+                            pointHoverRadius: 4,
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    stacked: false,
+                    plugins: {
+                        title: { display: true, text: 'Temperature and Cumulative TDD Trend' },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) label += ': ';
+                                    if (context.parsed.y !== null) {
+                                        const units = context.dataset.yAxisID === 'y1' ? ' °F-days' : ' °F';
+                                        label += context.parsed.y.toFixed(1) + units;
+                                    } else {
+                                        label += 'No data';
+                                    }
+                                    return label;
+                                }
+                            }
+                        },
+                        // Annotation Plugin Configuration (ensure plugin is registered)
+                        annotation: {
+                            annotations: {
+                                thresholdLine: {
+                                    type: 'line',
+                                    yScaleID: 'y1',
+                                    value: WATER_ON_THRESHOLD_F_DAYS,
+                                    borderColor: 'rgb(34, 197, 94)',
+                                    borderWidth: 2,
+                                    borderDash: [6, 6],
+                                    label: {
+                                        content: `Water On Threshold (${WATER_ON_THRESHOLD_F_DAYS} F-days)`,
+                                        display: true,
+                                        position: 'end',
+                                        backgroundColor: 'rgba(34, 197, 94, 0.7)',
+                                        color: 'white',
+                                        font: { size: 10 },
+                                        padding: { x: 4, y: 2 },
+                                        borderRadius: 4,
+                                        yAdjust: -5
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: { display: true, title: { display: true, text: 'Date' } },
+                        y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Avg Temp (°F)', color: 'rgb(59, 130, 246)' }, grid: { drawOnChartArea: true } },
+                        y1: { type: 'linear', display: true, position: 'right', title: { display: true, text: 'Cumulative TDD (°F-days)', color: 'rgb(234, 88, 12)' }, grid: { drawOnChartArea: false }, suggestedMin: 0 }
+                    }
+                }
+            });
+        }
+
+        // Set default dates: Jan 1st of current year to current date
+        window.onload = () => {
+            const today = new Date();
+            const currentYear = today.getFullYear();
+            const startDateDefault = new Date(currentYear, 0, 1); // Jan 1st
+            const endDateDefault = today; // Current date
+            startDateInput.value = formatDateKey(startDateDefault);
+            endDateInput.value = formatDateKey(endDateDefault);
+        };
+
+    </script>
+
+</body>
+</html>
+
